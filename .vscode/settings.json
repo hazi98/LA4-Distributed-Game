@@ -1,0 +1,8 @@
+{
+    "files.associations": {
+        "inet.h": "c",
+        "in.h": "c",
+        "wchar.h": "c",
+        "signal.h": "c"
+    }
+}

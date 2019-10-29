@@ -32,6 +32,7 @@
 /* global definitions                                                         */
 /* -------------------------------------------------------------------------- */
 #define BUFFERSIZE 4096 /* buffer size                         */
+const char *ip = "127.0.0.1";
 
 /* -------------------------------------------------------------------------- */
 /* global variables and structures                                            */
@@ -119,7 +120,7 @@ int main()
   /* ---------------------------------------------------------------------- */
   sock_write.sin_family = AF_INET;
   sock_write.sin_port = 27007;
-  inet_aton("200.13.89.15", (struct in_addr *)&sock_write.sin_addr);
+  inet_aton(ip, (struct in_addr *)&sock_write.sin_addr);
   memset(sock_write.sin_zero, 0, 8);
 
   /* ---------------------------------------------------------------------- */
