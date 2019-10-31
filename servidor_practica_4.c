@@ -39,6 +39,7 @@
 /* -------------------------------------------------------------------------- */
 #define BUFFERSIZE 4096 /* buffer size                         */
 #define MAX_MEMBERS 20  /* maximum number of members in room   */
+#define MAX_RONDAS 5
 const char *ip = "127.0.0.1";
 const int max_time = 10;
 
@@ -92,6 +93,38 @@ typedef struct
   cartas cartas[5];
 } mazos;
 
+typedef struct
+{
+  int chat_id;
+  int mazo_id;
+} jugadores;
+
+typedef struct
+{
+  // Juego
+  cartas baraja[52];
+  int ganadores[MAX_RONDAS]; // Array que guarda los IDs de los ganadores de cada ronda
+  // Ronda
+  int num_rondas;        // Numero de rondas
+  int cont_cartas_ronda; // Contador de las cartas en la ronda
+  mazos mazo[4];         // Mazos por cada jugador
+  mazos mazo_ronda;      // Cartas en la mesa en la ronda
+  // Jugadores
+  int contador_jugadores;
+  struct member list[20];
+  jugadores pila_jugadores[4];
+  // Comunicacion
+  int sfd;
+} game_args;
+
+// Global variables (Shared between threads)
+int reloj_control;                      // Solo puede existir un contador para iniciar la partida.
+volatile bool game_started = false;     // Bandera para controlar el estado del juego.
+volatile bool init_game = false;        // Bandera para indicar si se tiene que inicializar el juego.
+volatile bool start_next_round = false; // Bandera para saber si el hilo de control de partida debe de iniciar la siguiente ronda.
+volatile bool round_deck_full = false;  // Bandera para esperar a que todos los jugadores pongan una carta en la mesa.
+volatile bool end_game = false;         // Bandera para indicar al hilo de juego que termine su ejecución.
+
 // Hilo encargado de checar la actividad de los clientes.
 void *check_heartbeats(void *arg)
 {
@@ -119,22 +152,6 @@ void *check_heartbeats(void *arg)
             sendto(args->sfd, text1, strlen(text1), 0, (struct sockaddr *)&(args->list[i].address), sizeof(struct sockaddr_in));
       }
     }
-    // if (clock() > target_time)
-    // {
-    //   printf("5 secs.\n");
-    //   target_time = clock() + 5 * CLOCKS_PER_SEC;
-    //   for (int i = 0; i < MAX_MEMBERS; ++i)
-    //   {
-    //     if (clock() > *args->list[i].heartbeat_time)
-    //     {
-    //       printf("Client %d has exceeded maximum time.\n", i);
-    //     }
-    //     else
-    //     {
-    //       printf("Client %d with id %d is alive.\n", i, args->list[i].chat_id);
-    //     }
-    //   }
-    // }
   }
 }
 
@@ -167,7 +184,234 @@ void print_card(int i, cartas carta, void *text1)
     sprintf(text1, "Carta [%d]: %d %s\n", (i + 1), (carta.numero + 1), simbolo);
 }
 
-int reloj_control; // Solo puede existir un contador para iniciar la partida..
+void game_round(game_args *args)
+{
+  // Variables
+  int i, j, origen, destino, contador_cartas;
+  char text1[BUFFERSIZE]; // reading buffer
+  cartas carta_aux;
+  // Revolver las cartas
+  for (i = 0; i < 52; i++)
+  {
+    // Escoger origen y destino
+    do
+    {
+      origen = rand() % 52;
+      destino = rand() % 52;
+    } while (origen == destino);
+    // Intercambiar cartas
+    carta_aux = args->baraja[destino];
+    args->baraja[destino] = args->baraja[origen];
+    args->baraja[origen] = carta_aux;
+  }
+  char text_mazo[BUFFERSIZE] = "";
+  char text_aux[BUFFERSIZE] = "";
+  // Resetear contador de cartas para repartir la baraja
+  contador_cartas = 0;
+  // Apartar 5 cartas para cada jugador activo
+  for (i = 0; i < args->contador_jugadores; i++)
+  {
+    memset(text_mazo, 0, sizeof text_mazo);
+    if (args->pila_jugadores[i].chat_id != -1)
+    {
+      // Obtener el chat_id del jugador actual
+      int id_actual = args->list[args->pila_jugadores[i].chat_id].chat_id;
+      // Limpiar el buffer de texto
+      memset(text_aux, 0, sizeof text_aux);
+      printf("Deck %d\n", i);
+      // Copiar en el buffer el siguiente texto
+      sprintf(text_aux, "Deck %d\n", i);
+      strcat(text_mazo, text_aux);
+      for (j = 0; j < 5; j++)
+      {
+        // Saltar la carta si ya está usada
+        while (args->baraja[contador_cartas].jugador_id != -1)
+          contador_cartas++;
+        // Asignar el id de la carta al jugador actual
+        args->baraja[contador_cartas].jugador_id = id_actual;
+        // Poner la carta en el mazo del jugador
+        args->mazo[i].cartas[contador_cartas] = args->baraja[contador_cartas];
+        // Limpiar el texto auxiliar
+        memset(text_aux, 0, sizeof text_aux);
+        // Imprimir la carta en el texto auxiliar
+        print_card(j, args->mazo[i].cartas[contador_cartas], text_aux);
+        // Concatenar el texto auxiliar con el buffer de texto
+        strcat(text_mazo, text_aux);
+        // Aumentar la cuenta de cartas
+        contador_cartas++;
+      }
+      // Asignar el mazo ID al jugador
+      args->pila_jugadores[i].mazo_id = i;
+      // Enviar el mazo al jugador
+      sendto(args->sfd, text_mazo, strlen(text_mazo), 0, (struct sockaddr *)&(args->list[i].address), sizeof(struct sockaddr_in));
+    }
+  }
+  // Enviar mensaje a jugadores para que elijan una carta
+  sprintf(text1, "Players, choose a card from your deck.\n");
+  for (i = 0; i < args->contador_jugadores; ++i)
+    if (args->pila_jugadores[i].chat_id != -1)
+      sendto(args->sfd, text1, strlen(text1), 0, (struct sockaddr *)&(args->list[args->pila_jugadores[i].chat_id].address), sizeof(struct sockaddr_in));
+
+  // Resetear el contador de cartas en la ronda
+  args->cont_cartas_ronda = 0;
+}
+
+// A comparator function used by qsort
+int compare(const void *a, const void *b)
+{
+  return (*(int *)a - *(int *)b);
+}
+
+// Hilo encargado de gestionar el juego
+void *game_thread(void *arg)
+{
+  game_args *args = arg;
+  char text1[BUFFERSIZE]; // write buffer
+
+  // Loop principal del juego
+  do
+  {
+    // 1. Iniciar el juego si se da la indicación e inicializar la baraja
+    if (game_started == true && init_game == true)
+    {
+      // Inicializacion de la baraja
+      int contador_cartas, i, j;
+      // Asignar 13 numeros a cada palo
+      contador_cartas = 0;
+      for (i = 0; i < 4; i++)
+      {
+        for (j = 0; j < 13; j++)
+        {
+          args->baraja[contador_cartas].numero = j;
+          args->baraja[contador_cartas].palo = (palos)i;
+          contador_cartas++;
+        }
+      }
+      // Con éste mensaje, el servidor se pone en modo juego.
+      sprintf(text1, "Starting game");
+      for (i = 0; i < args->contador_jugadores; ++i)
+        sendto(args->sfd, text1, strlen(text1), 0, (struct sockaddr *)&(args->list[args->pila_jugadores[i].chat_id].address), sizeof(struct sockaddr_in));
+
+      // Indicar que la baraja ha sido inicializada
+      init_game = false;
+      // Dar la señal para que comiencen las rondas
+      args->num_rondas = 0;
+      start_next_round = true;
+    }
+
+    // 2. Gestionar las rondas
+    if (game_started == true && start_next_round == true && args->num_rondas < MAX_RONDAS)
+    {
+      // Iniciar ronda
+      game_round(args);
+      // Esperar a la siguiente ronda
+      start_next_round = false;
+    }
+
+    // 3. Esperar a que los jugadores pongan las cartas sobre la mesa, y cuando terminen, se calcula al ganador de la ronda.
+    if (game_started == true && round_deck_full == true)
+    {
+      // Calcular el ganador
+      int i, j, num_max = 0, jugador_id, contador_cartas = 0;
+      bool cartas_eliminadas = false;
+      for (i = 0; i < 5; i++)
+      {
+        if (args->mazo_ronda.cartas[i].numero > num_max)
+        {
+          num_max = args->mazo_ronda.cartas[i].numero;
+          jugador_id = args->mazo_ronda.cartas[i].jugador_id;
+        }
+      }
+      // Guardar el ganador de la ronda
+      args->ganadores[args->num_rondas] = jugador_id;
+      // Publicar el ganador
+      memset(text1, 0, sizeof text1);
+      sprintf(text1, "Round %d winner is player [%d]\n", (args->num_rondas + 1), jugador_id);
+      for (i = 0; i < args->contador_jugadores; ++i)
+        sendto(args->sfd, text1, strlen(text1), 0, (struct sockaddr *)&(args->list[args->pila_jugadores[i].chat_id].address), sizeof(struct sockaddr_in));
+      // Aumentar el numero de ronda
+      args->num_rondas++;
+      // Marcar el inicio de la siguiente ronda
+      start_next_round = true;
+      memset(text1, 0, sizeof text1);
+      printf("Starting next round...\n");
+      sprintf(text1, "Starting next round...\n");
+      for (i = 0; i < args->contador_jugadores; ++i)
+        sendto(args->sfd, text1, strlen(text1), 0, (struct sockaddr *)&(args->list[args->pila_jugadores[i].chat_id].address), sizeof(struct sockaddr_in));
+
+      // Sacar las cartas usadas de la baraja
+      do
+      {
+        printf("Finding cards to remove...\n");
+        // Buscar IDs en la baraja
+        for (i = 0; i < 52; i++)
+        {
+          // Si la carta en la baraja ya tiene ID, hay que quitarla
+          if (args->baraja[i].jugador_id != -1)
+          {
+            printf("Removing card: ");
+            print_card(i, args->baraja[i], false);
+            for (j = i; j < 52; j++)
+            {
+              args->baraja[j] = args->baraja[j + 1];
+            }
+            // Ir una carta atrás
+            i--;
+          }
+        }
+      } while (cartas_eliminadas == false);
+    }
+
+    // 4. Comprobar si se debe de continuar el juego o se acaba y se elige al ganador.
+    if (game_started == true && args->num_rondas >= MAX_RONDAS)
+    {
+      // Elegir al ganador
+      int i, max_count = 1, res = args->ganadores[0], curr_count = 1;
+      // Ordenar array
+      qsort(args->ganadores, 5, sizeof(int), compare);
+      // Encontrar la frecuencia máxima
+      for (i = 1; i < 5; i++)
+      {
+        if (args->ganadores[i] == args->ganadores[i - 1])
+          curr_count++;
+        else
+        {
+          if (curr_count > max_count)
+          {
+            max_count = curr_count;
+            res = args->ganadores[i - 1];
+          }
+          curr_count = 1;
+        }
+      }
+      // Si el ultimo elemento es el más frecuente
+      if (curr_count > max_count)
+      {
+        max_count = curr_count;
+        res = args->ganadores[5 - 1];
+      }
+      // Publicar el ganador del juego
+      memset(text1, 0, sizeof text1);
+      printf("Game winner is player [%d], congrats!\n", res);
+      sprintf(text1, "Game winner is player [%d], congrats!\n", res);
+      for (i = 0; i < args->contador_jugadores; ++i)
+        sendto(args->sfd, text1, strlen(text1), 0, (struct sockaddr *)&(args->list[args->pila_jugadores[i].chat_id].address), sizeof(struct sockaddr_in));
+
+      // Marcar el fin del juego
+      end_game = true;
+    }
+
+    // 5. Terminar el juego
+    if (game_started == true && end_game == true)
+    {
+      // Finalizar el hilo
+      printf("Game thread shutting down\n");
+      game_started = false;
+      exit(0);
+    }
+  } while (end_game == false);
+}
+
 /* -------------------------------------------------------------------------- */
 /* main ()                                                                    */
 /*                                                                            */
@@ -187,19 +431,15 @@ int main()
   int sfd;                         /* socket descriptor                   */
   int read_char;                   /* read characters                     */
   int ret_hb;                      // Heartbeat return
+  int ret_game;                    // Retorno del hilo de juego
   socklen_t length;                /* size of the read socket             */
   pthread_t thread1;               // Thread ID
-                                   // PARA EL CONTROL DE LOS JUGADORES *******************************************
-  int pila_jugadores[4];           // Pila almacenar el id de los jugadores.
-  int contador_jugadores;          // Para cuidar los límites de los jugadores.
-                                   // PARA EL CONTROL DE LAS CARTAS DEL JUEGO ************************************
-  cartas baraja[52];               // Para las 52 cartas.
-  int cant_cartas_mismo_num[13];   // Solo pueden existir 4 cartas con un número dado, p.e. 4 quinas.
-  int contador_cartas;
-  mazos mazo[4];
+  // PARA EL CONTROL DE LOS JUGADORES *******************************************
+  pthread_t thread2;             // Game thread ID
+  int cant_cartas_mismo_num[13]; // Solo pueden existir 4 cartas con un número dado, p.e. 4 quinas.
   // PARA EL CONTROL DEL JUEGO **************************************************
-  int iniciar_juego = 0;
-
+  int esperar_jugadores = 0;
+  game_args gameargs;
   /* ---------------------------------------------------------------------- */
   /* structure of the socket that will read what comes from the client      */
   /* ---------------------------------------------------------------------- */
@@ -220,15 +460,16 @@ int main()
   setlocale(LC_ALL, "");
   for (i = 0; i < 4; i++)
   {
-    pila_jugadores[i] = -1;
+    gameargs.pila_jugadores[i].chat_id = -1;
+    gameargs.pila_jugadores[i].mazo_id = -1;
   }
-  contador_jugadores = 0;
+  gameargs.contador_jugadores = 0;
   // Inicializacion de la baraja
   for (i = 0; i < 52; i++)
   {
-    baraja[i].numero = 0;
-    baraja[i].palo = 0;
-    baraja[i].jugador_id = -1;
+    gameargs.baraja[i].numero = 0;
+    gameargs.baraja[i].palo = 0;
+    gameargs.baraja[i].jugador_id = -1;
   }
   for (i = 0; i < 13; i++)
   {
@@ -246,7 +487,7 @@ int main()
     *list[i].heartbeat_time = clock() + 30 * CLOCKS_PER_SEC;
   }
 
-  // Creation of arguments for thread
+  // Creacion de argumentos para el heartbeat
   arguments *args = malloc(sizeof(arguments));
   struct member *list_ptr;
   list_ptr = list;
@@ -254,17 +495,12 @@ int main()
   args->participants = &participants;
   args->sfd = sfd;
 
-  // Thread creation
-  // Creation of the heartbeat thread
+  // Creacion del hilo de heartbeat
   ret_hb = pthread_create(&thread1, NULL, check_heartbeats, (void *)args);
   if (ret_hb)
-  {
     printf("Error creating heartbeat thread.\n");
-  }
   else
-  {
     printf("Heartbeat checker thread created.\n");
-  }
 
   /* ---------------------------------------------------------------------- */
   /* The socket is  read and the messages are  answered until the word exit */
@@ -307,7 +543,7 @@ int main()
 
       /* We notify the entrance to the chat of the new participant      */
       /* Variable i still keeps the number of the last member added     */
-      sprintf(text1, "Participante [%s] se ha unido al grupo.\n", message.data_text);
+      sprintf(text1, "Participant [%s] joined to the group.\n", message.data_text);
       for (j = 0; j < MAX_MEMBERS; ++j)
         if ((j != i) && (list[j].chat_id != -1))
           sendto(sfd, text1, strlen(text1), 0, (struct sockaddr *)&(list[j].address), sizeof(struct sockaddr_in));
@@ -338,31 +574,83 @@ int main()
           alarm(max_time);
         }
         // Agregamos a los jugadores que empiecen el juego a la pila de jugadores.
-        if (contador_jugadores < 4)
+        if (gameargs.contador_jugadores < 4)
         {
-          pila_jugadores[contador_jugadores] = message.chat_id;
-          contador_jugadores++;
+          gameargs.pila_jugadores[gameargs.contador_jugadores].chat_id = message.chat_id;
+          gameargs.contador_jugadores++;
         }
         else
         {
-          sprintf(text1, "Lo sentimos, el máximo de jugadores se ha alcanzado.\n");
+          sprintf(text1, "Sorry, the game lobby is full.\n");
           sendto(sfd, text1, strlen(text1), 0, (struct sockaddr *)&(list[message.chat_id].address), sizeof(struct sockaddr_in));
         }
-
         printf("Type:[%d], Part:[%d], [%s] Started the Game\n\n", message.data_type, message.chat_id, list[message.chat_id].alias);
-        sprintf(text1, "[%s] Started the Game, waiting for other players...\n", list[message.chat_id].alias);
+        if (esperar_jugadores == 0)
+          sprintf(text1, "Player [%s] has started the Game, waiting for other players...\n", list[message.chat_id].alias);
+        else
+          sprintf(text1, "Player [%s] has joined the Game, waiting for other players...\n", list[message.chat_id].alias);
+        esperar_jugadores++;
       }
       else
       {
         sprintf(text1, "[%s]:[%s]", list[message.chat_id].alias, message.data_text);
       }
+
       // El mensaje se replica para todos los participantes.
       for (i = 0; i < MAX_MEMBERS; ++i)
         if ((i != message.chat_id) && (list[i].chat_id != -1))
           sendto(sfd, text1, strlen(text1), 0, (struct sockaddr *)&(list[i].address), sizeof(struct sockaddr_in));
-      // CUANDO EL JUEGO ESTÁ INICIADO
-      if (iniciar_juego == 1)
+
+      // *************************************************************************
+      // RECEPCIÓN DE MENSAJES DE JUEGO
+      // *************************************************************************
+      // Pedir cartas de la ronda a los jugadores
+      if (game_started == true && round_deck_full == false)
       {
+        // Recibir las cartas de los jugadores
+        int num_carta, mazo_id = -1, jugador_id = -1;
+        bool permitir_carta = true;
+        // Buscar en la pila de jugadores el numero de mazo del jugador
+        for (i = 0; i < gameargs.contador_jugadores; i++)
+        {
+          if (gameargs.pila_jugadores[i].chat_id == message.chat_id)
+          {
+            // Encontramos al jugador
+            jugador_id = gameargs.pila_jugadores[i].chat_id;
+            mazo_id = gameargs.pila_jugadores[i].mazo_id;
+            // Salir de la búsqueda
+            break;
+          }
+        }
+        // Verificar en las cartas de la mesa si ya existe una carta de dicho jugador
+        for (i = 0; i < 5; i++)
+        {
+          if (gameargs.mazo_ronda.cartas[i].jugador_id == jugador_id)
+          {
+            // El jugador ya tiene una carta en la mesa, por lo que no debemos de permitir que meta otra
+            permitir_carta = false;
+          }
+        }
+        // Si no se encuentra al jugador, marcar error
+        if (mazo_id == -1)
+        {
+          printf("Error trying to find the player's deck.\n");
+          permitir_carta = false;
+        }
+        if (permitir_carta == true)
+        {
+          // Obtener el numero de carta del mazo del jugador
+          sscanf(message.data_text, "%d", &num_carta);
+          // Sacar la carta del mazo y ponerla en la mesa
+          gameargs.mazo_ronda.cartas[gameargs.cont_cartas_ronda++] = gameargs.mazo[mazo_id].cartas[num_carta];
+          printf("Card received from player [%d].", jugador_id);
+          print_card(num_carta, gameargs.mazo_ronda.cartas[gameargs.cont_cartas_ronda], false);
+          // Comprobar si ya todos los jugadores han puesto su carta
+          if (gameargs.cont_cartas_ronda == gameargs.contador_jugadores)
+          {
+            round_deck_full = true;
+          }
+        }
       }
     }
 
@@ -371,7 +659,7 @@ int main()
       // Receive a heartbeat
       // Update the heartbeat time
       *list[message.chat_id].heartbeat_time = clock() + 30 * CLOCKS_PER_SEC;
-      //printf("=== <3 === <3 === <3 === [%s] === <3 === <3 === <3 ===\n\n", list[message.chat_id].alias);
+      printf("=== <3 === <3 === <3 === [%s] === <3 === <3 === <3 ===\n\n", list[message.chat_id].alias);
     }
     // *************************************************************************
     // EN ESTA SECCIÓN VERIFICAMOS SI EL JUEGO DEBE EMPEZAR O NO.
@@ -381,106 +669,52 @@ int main()
     if (reloj_control == max_time)
     {
       reloj_control = 0;
-      if (contador_jugadores >= 2 && contador_jugadores <= 4)
+      if (gameargs.contador_jugadores >= 2 && gameargs.contador_jugadores <= 4)
       {
         printf("Los jugadores de la partida son:\n");
         for (i = 0; i < 4; i++)
         {
-          if (pila_jugadores[i] != -1)
+          if (gameargs.pila_jugadores[i].chat_id != -1)
           {
-            printf("%d): [%s]\n", (i + 1), list[pila_jugadores[i]].alias);
-            sprintf(text1, "%d): [%s]\n", (i + 1), list[pila_jugadores[i]].alias);
+            printf("%d): [%s]\n", (i + 1), list[gameargs.pila_jugadores[i].chat_id].alias);
+            sprintf(text1, "%d): [%s]\n", (i + 1), list[gameargs.pila_jugadores[i].chat_id].alias);
           }
           // El mensaje se replica para todos los participantes.
           for (j = 0; j < MAX_MEMBERS; ++j)
             for (k = 0; k < 4; k++)
             {
-              if ((pila_jugadores[k] != -1) && (list[i].chat_id != -1) && (pila_jugadores[k] == list[j].chat_id))
+              if ((gameargs.pila_jugadores[k].chat_id != -1) && (list[i].chat_id != -1) && (gameargs.pila_jugadores[k].chat_id == list[j].chat_id))
                 sendto(sfd, text1, strlen(text1), 0, (struct sockaddr *)&(list[j].address), sizeof(struct sockaddr_in));
             }
         }
-        int i, j, origen, destino;
-        cartas carta_aux;
-        // Asignar 13 numeros a cada palo
-        contador_cartas = 0;
-        for (i = 0; i < 4; i++)
+        // Setear las variables globales para que el hilo de juego comienze a trabajar.
+        game_started = true;
+        init_game = true;
+        // Crear los argumentos del juego
+        for (i = 0; i < MAX_MEMBERS; i++)
         {
-          for (j = 0; j < 13; j++)
-          {
-            baraja[contador_cartas].numero = j;
-            baraja[contador_cartas].palo = (palos)i;
-            // print_card(contador_cartas, baraja[contador_cartas]);
-            contador_cartas++;
-          }
+          gameargs.list[i] = list[i];
         }
-
-        // Con éste mensaje, el cliente se pone en modo juego.
-        sprintf(text1, "GAME STARTED");
-        for (i = 0; i < contador_jugadores; ++i)
-          sendto(sfd, text1, strlen(text1), 0, (struct sockaddr *)&(list[pila_jugadores[i]].address), sizeof(struct sockaddr_in));
-        iniciar_juego = 1;
-
-        // ================
-        // INICIO DEL JUEGO
-        // ================
-
-        // Revolver las cartas
-        for (i = 0; i < 52; i++)
-        {
-          // Escoger origen y destino
-          do
-          {
-            origen = rand() % 52;
-            destino = rand() % 52;
-          } while (origen == destino);
-          // Intercambiar cartas
-          carta_aux = baraja[destino];
-          baraja[destino] = baraja[origen];
-          baraja[origen] = carta_aux;
-        }
-        char text_mazo[BUFFERSIZE] = "";
-        char text_aux[BUFFERSIZE] = "";
-        // Resetear contador de cartas para repartir la baraja
-        contador_cartas = 0;
-        // Apartar 5 cartas para cada jugador activo
-        for (i = 0; i < contador_jugadores; i++)
-        {
-          memset(text_mazo, 0, sizeof text_mazo);
-          if (pila_jugadores[i] != -1)
-          {
-            int id_actual = list[pila_jugadores[i]].chat_id;
-            memset(text_aux, 0, sizeof text_aux);
-            printf("Mazo %d\n", i);
-            sprintf(text_aux, "Mazo %d\n", i);
-            strcat(text_mazo, text_aux);
-            for (j = 0; j < 5; j++)
-            {
-              // Asignar el id de la carta al jugador actual
-              baraja[contador_cartas].jugador_id = id_actual;
-              // Poner la carta en el mazo del jugador
-              mazo[i].cartas[contador_cartas] = baraja[contador_cartas];
-              memset(text_aux, 0, sizeof text_aux);
-              print_card(contador_cartas, mazo[i].cartas[contador_cartas], text_aux);
-              strcat(text_mazo, text_aux);
-              contador_cartas++;
-            }
-            // Enviar el mazo al jugador
-            sendto(sfd, text_mazo, strlen(text_mazo), 0, (struct sockaddr *)&(list[i].address), sizeof(struct sockaddr_in));
-          }
-        }
-        // Enviar mensaje a jugadores para que elijan una carta
+        gameargs.sfd = sfd;
+        // Crear el hilo de juego
+        ret_game = pthread_create(&thread2, NULL, game_thread, (void *)&gameargs);
+        if (ret_hb)
+          printf("Error creating heartbeat thread.\n");
+        else
+          printf("Heartbeat checker thread created.\n");
       }
       else
       {
         // En el caso de que hagan falta jugadores..
         sprintf(text1, "Faltan jugadores.\n");
-        for (i = 0; i < contador_jugadores; ++i)
-          sendto(sfd, text1, strlen(text1), 0, (struct sockaddr *)&(list[pila_jugadores[i]].address), sizeof(struct sockaddr_in));
+        for (i = 0; i < gameargs.contador_jugadores; ++i)
+          sendto(sfd, text1, strlen(text1), 0, (struct sockaddr *)&(list[gameargs.pila_jugadores[i].chat_id].address), sizeof(struct sockaddr_in));
         for (i = 0; i < 4; i++)
         {
-          pila_jugadores[i] = -1;
+          gameargs.pila_jugadores[i].chat_id = -1;
+          gameargs.pila_jugadores[i].mazo_id = -1;
         }
-        contador_jugadores = 0;
+        gameargs.contador_jugadores = 0;
       }
       // Una vez desplegado el nombre a todos los jugadores... validamos que existan al menos dos jugadores.
     }
